@@ -317,6 +317,20 @@ def void_transaction(conn, txn_id: int, reason: str = "") -> None:
         audit(conn, "void", "transaction", txn_id, {"reason": reason.strip(), "before": _snapshot(conn, txn_id)})
 
 
+def restore_transaction(conn, txn_id: int) -> None:
+    """Undo a void. The void and the restore both stay in the audit log."""
+    current = conn.execute("SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
+    if current is None:
+        raise LedgerError("transaction not found")
+    if not current["voided_at"]:
+        raise LedgerError("transaction is not voided")
+    with conn:
+        conn.execute("UPDATE transactions SET voided_at = NULL, void_reason = '' WHERE id = ?", (txn_id,))
+        audit(conn, "restore", "transaction", txn_id, {
+            "voided_at": current["voided_at"], "void_reason": current["void_reason"],
+        })
+
+
 def _snapshot(conn, txn_id):
     t = conn.execute("SELECT * FROM transactions WHERE id = ?", (txn_id,)).fetchone()
     ps = conn.execute(

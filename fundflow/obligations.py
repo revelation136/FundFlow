@@ -220,8 +220,20 @@ def plan(conn, today: date | None = None) -> dict:
            FROM obligations o LEFT JOIN funds f ON f.id = o.fund_id
            WHERE o.archived = 0 ORDER BY o.name"""
     )]
+    txn_counts = {
+        r[0]: r[1] for r in conn.execute(
+            "SELECT obligation_id, COUNT(*) FROM transactions WHERE obligation_id IS NOT NULL GROUP BY obligation_id"
+        )
+    }
     for ob in obs:
         ob.update(_status(ob, stats.get(ob["id"], {}), today))
+        ob["txn_count"] = txn_counts.get(ob["id"], 0)
+    archived = [
+        {**dict(r), "txn_count": txn_counts.get(r["id"], 0)}
+        for r in conn.execute(
+            "SELECT id, name, kind, amount, frequency, total_payments FROM obligations WHERE archived = 1 ORDER BY name"
+        )
+    ]
 
     # Money already put into each sinking fund this month counts toward this
     # month's set-aside, so the target does not move after you fund it.
@@ -318,6 +330,7 @@ def plan(conn, today: date | None = None) -> dict:
         "obligations": obs,
         "totals": totals,
         "upcoming": upcoming[:60],
+        "archived": archived,
         "unallocated": unallocated,
         "free_to_spend": unallocated - totals["set_aside_this_month"] - totals["shortfall_now"],
     }

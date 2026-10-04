@@ -43,6 +43,18 @@ def _rows(sql, args=()):
     return [dict(r) for r in conn().execute(sql, args)]
 
 
+def _usage(c, column) -> dict:
+    """How many transactions (voided included) touch each account / fund."""
+    return {
+        r[0]: r[1]
+        for r in c.execute(f"SELECT {column}, COUNT(DISTINCT transaction_id) FROM postings GROUP BY {column}")
+    }
+
+
+def _obligations_using(c, where, ident) -> list:
+    return [r["name"] for r in c.execute(f"SELECT name FROM obligations WHERE {where}", (ident,) * where.count("?"))]
+
+
 def _accounts_by_id():
     return {r["id"]: r for r in _rows("SELECT * FROM accounts")}
 
@@ -110,10 +122,13 @@ def update_settings():
 
 @bp.get("/accounts")
 def list_accounts():
-    bal = ledger.balances(conn())
+    c = conn()
+    bal = ledger.balances(c)
+    used = _usage(c, "account_id")
     out = []
     for a in _rows("SELECT * FROM accounts ORDER BY kind, archived, name"):
         a["balance"] = bal["accounts"].get(a["id"], 0)
+        a["txn_count"] = used.get(a["id"], 0)
         out.append(a)
     return jsonify(accounts=out)
 
@@ -153,6 +168,20 @@ def update_account(account_id):
     for key in ("subtype", "notes"):
         if key in data:
             changes[key] = str(data[key] or "")
+    if "kind" in data and data["kind"] != acct["kind"]:
+        if data["kind"] not in ACCOUNT_KINDS:
+            raise LedgerError(f"kind must be one of: {', '.join(ACCOUNT_KINDS)}")
+        if acct["is_system"]:
+            raise LedgerError("system accounts cannot change type")
+        if _usage(c, "account_id").get(account_id):
+            raise LedgerError(
+                "this account already has transactions, so it can only switch between types of the same kind "
+                "(e.g. bank to e-wallet)"
+            )
+        users = _obligations_using(c, "account_id = ? OR category_id = ?", account_id)
+        if users:
+            raise LedgerError(f"used by obligation(s) {', '.join(users)}; change those first")
+        changes["kind"] = data["kind"]
     if "archived" in data:
         changes["archived"] = 1 if data["archived"] else 0
         if changes["archived"] and acct["kind"] in HOLDING_KINDS:
@@ -166,6 +195,28 @@ def update_account(account_id):
             c.execute(f"UPDATE accounts SET {sets} WHERE id = ?", (*changes.values(), account_id))
             audit(c, "update", "account", account_id, {"before": dict(acct), "changes": changes})
     return jsonify(account=dict(c.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()))
+
+
+@bp.delete("/accounts/<int:account_id>")
+def delete_account(account_id):
+    c = conn()
+    acct = c.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if acct is None:
+        return jsonify(error="account not found"), 404
+    if acct["is_system"]:
+        raise LedgerError("system accounts cannot be deleted")
+    used = _usage(c, "account_id").get(account_id, 0)
+    if used:
+        raise LedgerError(
+            f"{acct['name']} appears in {used} transaction(s), so it stays in the ledger. Archive it instead."
+        )
+    users = _obligations_using(c, "account_id = ? OR category_id = ?", account_id)
+    if users:
+        raise LedgerError(f"used by obligation(s) {', '.join(users)}; change those first")
+    with c:
+        c.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        audit(c, "delete", "account", account_id, {"before": dict(acct)})
+    return jsonify(ok=True)
 
 
 @bp.get("/accounts/<int:account_id>")
@@ -225,9 +276,11 @@ def list_funds():
     c = conn()
     bal = ledger.balances(c)
     accounts = _accounts_by_id()
+    used = _usage(c, "fund_id")
     out = []
     for f in _rows("SELECT * FROM funds ORDER BY is_system DESC, archived, name"):
         f["balance"] = bal["funds"].get(f["id"], 0)
+        f["txn_count"] = used.get(f["id"], 0)
         f["by_account"] = [
             {"account_id": a, "account_name": accounts[a]["name"], "amount": v}
             for (a, fid), v in bal["cells"].items()
@@ -267,6 +320,28 @@ def update_fund(fund_id):
             c.execute(f"UPDATE funds SET {sets} WHERE id = ?", (*changes.values(), fund_id))
             audit(c, "update", "fund", fund_id, {"before": dict(fund), "changes": changes})
     return jsonify(fund=dict(c.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()))
+
+
+@bp.delete("/funds/<int:fund_id>")
+def delete_fund(fund_id):
+    c = conn()
+    fund = c.execute("SELECT * FROM funds WHERE id = ?", (fund_id,)).fetchone()
+    if fund is None:
+        return jsonify(error="fund not found"), 404
+    if fund["is_system"]:
+        raise LedgerError("the Unallocated fund cannot be deleted")
+    used = _usage(c, "fund_id").get(fund_id, 0)
+    if used:
+        raise LedgerError(
+            f"{fund['name']} appears in {used} transaction(s), so it stays in the ledger. Archive it instead."
+        )
+    users = _obligations_using(c, "fund_id = ?", fund_id)
+    if users:
+        raise LedgerError(f"sinking fund for {', '.join(users)}; link those obligations to another fund first")
+    with c:
+        c.execute("DELETE FROM funds WHERE id = ?", (fund_id,))
+        audit(c, "delete", "fund", fund_id, {"before": dict(fund)})
+    return jsonify(ok=True)
 
 
 @bp.get("/funds/<int:fund_id>")
@@ -389,6 +464,13 @@ def void_transaction(txn_id):
     c = conn()
     data = request.get_json(silent=True) or {}
     ledger.void_transaction(c, txn_id, str(data.get("reason") or ""))
+    return jsonify(transaction=ledger.get_transaction(c, txn_id))
+
+
+@bp.post("/transactions/<int:txn_id>/restore")
+def restore_transaction(txn_id):
+    c = conn()
+    ledger.restore_transaction(c, txn_id)
     return jsonify(transaction=ledger.get_transaction(c, txn_id))
 
 
@@ -529,6 +611,21 @@ def update_obligation(ob_id):
             c.execute(f"UPDATE obligations SET {sets} WHERE id = ?", (*changes.values(), ob_id))
             audit(c, "update", "obligation", ob_id, {"before": dict(ob), "changes": changes})
     return jsonify(obligation=dict(c.execute("SELECT * FROM obligations WHERE id = ?", (ob_id,)).fetchone()))
+
+
+@bp.delete("/obligations/<int:ob_id>")
+def delete_obligation(ob_id):
+    c = conn()
+    ob = c.execute("SELECT * FROM obligations WHERE id = ?", (ob_id,)).fetchone()
+    if ob is None:
+        return jsonify(error="obligation not found"), 404
+    n = c.execute("SELECT COUNT(*) FROM transactions WHERE obligation_id = ?", (ob_id,)).fetchone()[0]
+    if n:
+        raise LedgerError(f"{ob['name']} has {n} recorded payment(s), so it stays in the ledger. Archive it instead.")
+    with c:
+        c.execute("DELETE FROM obligations WHERE id = ?", (ob_id,))
+        audit(c, "delete", "obligation", ob_id, {"before": dict(ob)})
+    return jsonify(ok=True)
 
 
 @bp.get("/obligations/<int:ob_id>")

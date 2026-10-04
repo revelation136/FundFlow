@@ -56,6 +56,44 @@ function open(html, { onSubmit, onInput, onClick } = {}) {
 
 export const closeModal = () => dlg.close();
 
+/**
+ * Small confirm / text-input dialog that stacks on top of any open form.
+ * Resolves to the entered text (input mode), true (confirm mode) or null if cancelled.
+ */
+const askDlg = document.getElementById('ask');
+export function ask({ title, message = '', input = null, confirm = 'OK', danger = false }) {
+  return new Promise((resolve) => {
+    askDlg.innerHTML = `<form method="dialog" novalidate>
+      <div class="modal-head"><h2>${esc(title)}</h2></div>
+      <div class="modal-body">${message ? `<p class="ink-2">${esc(message)}</p>` : ''}
+        ${input ? `<label class="field">${esc(input.label)}<input name="value" value="${esc(input.value || '')}" placeholder="${esc(input.placeholder || '')}" autocomplete="off"></label>` : ''}
+        <p class="form-error" role="alert"></p></div>
+      <div class="modal-foot"><button type="button" class="btn" data-cancel>Cancel</button>
+        <button type="submit" class="btn ${danger ? 'btn-danger-solid' : 'btn-primary'}">${esc(confirm)}</button></div></form>`;
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      askDlg.close();
+      resolve(value);
+    };
+    askDlg.querySelector('[data-cancel]').onclick = () => finish(null);
+    askDlg.querySelector('form').onsubmit = (e) => {
+      e.preventDefault();
+      if (!input) return finish(true);
+      const value = askDlg.querySelector('[name=value]').value.trim();
+      if (input.required && !value) {
+        askDlg.querySelector('.form-error').textContent = `${input.label} is required`;
+        return undefined;
+      }
+      return finish(value);
+    };
+    askDlg.oncancel = (e) => { e.preventDefault(); finish(null); };
+    askDlg.showModal();
+    (askDlg.querySelector('input') || askDlg.querySelector('[type=submit]')).focus();
+  });
+}
+
 // ------------------------------------------------------------ field helpers
 
 const HOLDING = ['asset', 'liability'];
@@ -95,8 +133,8 @@ const amountInput = (name, value, extra = '') =>
 async function quickCreate(select) {
   const kind = select.value.split(':')[1];
   const label = kind === 'fund' ? 'fund' : kind === 'income' ? 'income source' : kind === 'expense' ? 'expense category' : 'account';
-  const name = window.prompt(`Name of the new ${label}:`);
-  if (!name || !name.trim()) { select.value = ''; return null; }
+  const name = await ask({ title: `New ${label}`, input: { label: 'Name', required: true }, confirm: 'Create' });
+  if (!name) { select.value = ''; return null; }
   try {
     let created;
     if (kind === 'fund') created = (await api('/funds', { method: 'POST', body: { name: name.trim() } })).fund;
@@ -415,6 +453,203 @@ export async function openTxnModal({ type = 'expense', txn = null, preset = {} }
   updateHints(form, current, ctx);
 }
 
+// ------------------------------------------------- transaction quick actions
+
+export async function editTxn(id) {
+  const { transaction } = await api(`/transactions/${id}`);
+  if (transaction.voided_at) throw new Error('Restore this transaction before editing it.');
+  return openTxnModal({ txn: transaction });
+}
+
+export async function duplicateTxn(id) {
+  const { transaction: t } = await api(`/transactions/${id}`);
+  return openTxnModal({ type: t.type, preset: { ...(t.form || {}), description: t.description, reference: '' } });
+}
+
+export async function voidTxn(id) {
+  const reason = await ask({
+    title: 'Void this transaction?',
+    message: 'It stays in the ledger but stops affecting balances. You can restore it any time.',
+    input: { label: 'Reason (kept in the audit log)', placeholder: 'e.g. duplicate entry' },
+    confirm: 'Void', danger: true,
+  });
+  if (reason === null) return false;
+  await api(`/transactions/${id}/void`, { method: 'POST', body: { reason } });
+  toast('Transaction voided — it no longer affects balances');
+  await afterSave();
+  return true;
+}
+
+export async function restoreTxn(id) {
+  await api(`/transactions/${id}/restore`, { method: 'POST' });
+  toast('Transaction restored');
+  await afterSave();
+}
+
+async function confirmDelete(path, name) {
+  const ok = await ask({
+    title: `Delete “${name}”?`,
+    message: 'It has never been used in a transaction, so no history is lost. This cannot be undone.',
+    confirm: 'Delete', danger: true,
+  });
+  if (!ok) return false;
+  await api(path, { method: 'DELETE' });
+  toast(`Deleted “${name}”`);
+  return true;
+}
+
+export async function deleteRecord(kind, id) {
+  await loadRefs();
+  const rec = kind === 'fund' ? fund(id) : kind === 'account' ? acct(id) : (await api(`/obligations/${id}`)).obligation;
+  const path = `/${kind === 'fund' ? 'funds' : kind === 'account' ? 'accounts' : 'obligations'}/${id}`;
+  if (await confirmDelete(path, rec?.name || `#${id}`)) {
+    if (location.hash.startsWith(`#/${kind}s/${id}`)) location.hash = `#/${kind}s`;
+    await afterSave();
+  }
+}
+
+// ------------------------------------------------- allocation & reconciliation
+
+function cellOf(balances, accountId, fundId) {
+  const c = balances.cells.find((x) => x.account_id === Number(accountId) && x.fund_id === Number(fundId));
+  return c ? c.amount : 0;
+}
+
+/** Set how much of one account belongs to one fund; the difference moves to/from another fund. */
+export async function openAdjustAllocation({ accountId = null, fundId = null } = {}) {
+  await loadRefs();
+  const balances = await api('/balances');
+  const unalloc = S.meta.system.unallocated_fund;
+  const holding = S.accounts.filter((a) => HOLDING.includes(a.kind) && !a.archived);
+  if (!holding.length) throw new Error('Add an account first.');
+  if (!accountId) {
+    const best = fundId
+      ? holding.map((a) => ({ a, v: cellOf(balances, a.id, fundId) })).sort((x, y) => y.v - x.v)[0]
+      : null;
+    accountId = (best && best.v ? best.a : holding[0]).id;
+  }
+  const otherWithMoney = (acc, notFund) => balances.cells
+    .filter((c) => c.account_id === Number(acc) && c.fund_id !== Number(notFund) && c.amount > 0)
+    .sort((x, y) => y.amount - x.amount)[0]?.fund_id;
+  if (!fundId) fundId = otherWithMoney(accountId, unalloc) || unalloc;
+  const counter = Number(fundId) === unalloc ? otherWithMoney(accountId, unalloc) || '' : unalloc;
+  const current = cellOf(balances, accountId, fundId);
+
+  const body = `<p class="type-help">Change how much of an account belongs to a fund. The money stays in the account; the difference moves to or from another fund, recorded as an allocation.</p>
+    <div class="form-grid">
+      ${field('Account', `<select name="account_id" data-recalc>${accountOptions(HOLDING, accountId, { allowNew: false })}</select>`)}
+      ${field('Fund', `<select name="fund_id" data-recalc>${fundOptions(fundId, { allowNew: false })}</select>`)}
+      <p class="callout span-2" data-current></p>
+      ${field('New amount for this fund', amountInput('target', current))}
+      ${field('Take from / return to', `<select name="counter_id">${fundOptions(counter, { allowNew: false, placeholder: 'Choose fund…' })}</select>`)}
+      ${field('Date', `<input type="date" name="date" value="${esc(today())}">`)}
+      ${field('Description', '<input name="description" value="Reallocation">')}
+      <p class="callout span-2" data-preview></p>
+    </div>`;
+
+  const update = (form, resetTarget) => {
+    const fd = new FormData(form);
+    const a = acct(fd.get('account_id'));
+    const f = fund(fd.get('fund_id'));
+    const cur = cellOf(balances, fd.get('account_id'), fd.get('fund_id'));
+    if (resetTarget) form.querySelector('[name=target]').value = toInput(cur);
+    form.querySelector('[data-current]').innerHTML = a && f
+      ? `<b>${esc(f.name)}</b> currently has <b>${esc(money(cur))}</b> in ${esc(a.name)}.` : 'Choose an account and a fund.';
+    const target = parseAmount(fd.get('target'), { allowNegative: true });
+    const other = fund(fd.get('counter_id'));
+    const preview = form.querySelector('[data-preview]');
+    const diff = Number.isNaN(target) || target === null ? 0 : target - cur;
+    preview.classList.remove('warn');
+    if (!diff || !f) { preview.textContent = 'No change yet.'; return; }
+    if (!other) { preview.textContent = 'Choose the fund to take from or return to.'; return; }
+    const from = diff > 0 ? other : f;
+    const to = diff > 0 ? f : other;
+    const fromHas = cellOf(balances, fd.get('account_id'), from.id);
+    preview.innerHTML = `Moves <b>${esc(money(Math.abs(diff)))}</b> from ${esc(from.name)} to ${esc(to.name)} inside ${esc(a.name)}.`
+      + (fromHas < Math.abs(diff) ? ` ${esc(from.name)} only has ${esc(money(fromHas))} there, so it would go negative.` : '');
+    preview.classList.toggle('warn', fromHas < Math.abs(diff));
+  };
+
+  const form = open(modalShell({ title: 'Adjust allocation', body, submit: 'Apply' }), {
+    onInput: (e, f) => update(f, e.type === 'change' && e.target.hasAttribute('data-recalc')),
+    onSubmit: async (f) => {
+      const fd = new FormData(f);
+      const cur = cellOf(balances, fd.get('account_id'), fd.get('fund_id'));
+      const target = parseAmount(fd.get('target'), { allowNegative: true });
+      if (target === null || Number.isNaN(target)) throw new Error('Enter the new amount');
+      const diff = target - cur;
+      if (!diff) throw new Error('The amount did not change');
+      const fundId2 = Number(fd.get('fund_id'));
+      const other = Number(fd.get('counter_id'));
+      if (!other) throw new Error('Choose the fund to take from or return to');
+      if (other === fundId2) throw new Error('Choose a different fund to take from or return to');
+      await api('/transactions', {
+        method: 'POST',
+        body: {
+          type: 'allocation', date: fd.get('date'), description: fd.get('description'),
+          account_id: Number(fd.get('account_id')),
+          from_fund_id: diff > 0 ? other : fundId2,
+          splits: [{ fund_id: diff > 0 ? fundId2 : other, amount: Math.abs(diff) }],
+        },
+      });
+      return 'Allocation adjusted';
+    },
+  });
+  update(form, false);
+}
+
+/** Make an account match its real balance (bank app / statement) with an audited adjustment. */
+export async function openReconcile(accountId) {
+  await loadRefs();
+  const a = acct(accountId);
+  if (!a || !HOLDING.includes(a.kind)) throw new Error('Only bank, e-wallet, cash and card accounts can be reconciled.');
+  const balances = await api('/balances');
+  const current = balances.accounts[a.id] || 0;
+  const owed = a.kind === 'liability';
+  const body = `<p class="type-help">Enter the balance your bank or e-wallet app shows. FundFlow records the difference as an adjustment, so the change is visible in the ledger and audit log.</p>
+    <div class="form-grid">
+      <p class="callout span-2">FundFlow shows <b>${esc(money(current))}</b> ${owed ? 'owed on' : 'in'} ${esc(a.name)}.</p>
+      ${field(owed ? 'Actual amount owed' : 'Actual balance', amountInput('actual', current, 'data-actual'))}
+      ${field('Put the difference in fund', `<select name="fund_id">${fundOptions(S.meta.system.unallocated_fund, { allowNew: false })}</select>`)}
+      ${field('Date', `<input type="date" name="date" value="${esc(today())}">`)}
+      ${field('Description', '<input name="description" value="Balance adjustment">')}
+      <p class="callout span-2" data-preview>No difference yet.</p>
+    </div>`;
+  // Extra money lands in Unallocated; a shortfall comes out of the fund that
+  // holds the most in this account (so no fund is pushed below zero).
+  const unalloc = S.meta.system.unallocated_fund;
+  const richest = balances.cells.filter((c) => c.account_id === a.id && c.amount > 0)
+    .sort((x, y) => y.amount - x.amount)[0]?.fund_id || unalloc;
+  let fundTouched = false;
+  open(modalShell({ title: `Reconcile ${a.name}`, body, submit: 'Record adjustment' }), {
+    onInput: (e, f) => {
+      if (e.target.name === 'fund_id') fundTouched = true;
+      const actual = parseAmount(new FormData(f).get('actual'), { allowNegative: true });
+      const diff = actual === null || Number.isNaN(actual) ? 0 : actual - current;
+      const select = f.querySelector('[name=fund_id]');
+      if (!fundTouched && diff) select.value = String(diff < 0 && !owed ? richest : unalloc);
+      const chosen = fund(select.value);
+      f.querySelector('[data-preview]').innerHTML = diff
+        ? `Records an adjustment of <b>${esc(money(diff, { sign: true }))}</b> in ${esc(chosen?.name || 'the chosen fund')}.` : 'No difference yet.';
+    },
+    onSubmit: async (f) => {
+      const fd = new FormData(f);
+      const actual = parseAmount(fd.get('actual'), { allowNegative: true });
+      if (actual === null || Number.isNaN(actual)) throw new Error('Enter the actual balance');
+      const diff = actual - current;
+      if (!diff) throw new Error('Already matches — nothing to adjust');
+      await api('/transactions', {
+        method: 'POST',
+        body: {
+          type: 'adjustment', date: fd.get('date'), description: fd.get('description'),
+          account_id: a.id, fund_id: Number(fd.get('fund_id')), amount: diff,
+        },
+      });
+      return `${a.name} reconciled`;
+    },
+  });
+}
+
 // ---------------------------------------------------------- transaction view
 
 export async function openTxnDetail(id) {
@@ -434,26 +669,19 @@ export async function openTxnDetail(id) {
       <tbody>${rows}</tbody>
       <tfoot><tr><td colspan="2">Balanced</td><td class="num">${esc(money(t.amount))}</td><td class="num">${esc(money(t.amount))}</td></tr></tfoot></table></div>
     <div><h3>History</h3><ul class="small">${history}</ul></div>`;
-  const editable = !t.voided_at && t.type !== 'journal';
-  open(modalShell({
-    title: `Transaction #${t.id}`,
-    body,
-    submit: '',
-    danger: editable ? '<button type="button" class="btn btn-danger" data-void>Void…</button><button type="button" class="btn" data-edit>Edit</button>' : '',
-    wide: true,
-  }), {
+  const editable = t.type !== 'journal';
+  const buttons = t.voided_at
+    ? '<button type="button" class="btn" data-restore>Restore</button>'
+    : `<button type="button" class="btn btn-danger" data-void>Void…</button>
+       ${editable ? '<button type="button" class="btn" data-duplicate>Duplicate</button><button type="button" class="btn btn-primary" data-edit>Edit</button>' : ''}`;
+  open(modalShell({ title: `Transaction #${t.id}`, body, submit: '', danger: buttons, wide: true }), {
     onClick: async (e) => {
-      if (e.target.closest('[data-edit]')) openTxnModal({ txn: t });
-      if (e.target.closest('[data-void]')) {
-        const reason = window.prompt('Why are you voiding this transaction? (kept in the audit log)');
-        if (reason === null) return;
-        try {
-          await api(`/transactions/${t.id}/void`, { method: 'POST', body: { reason } });
-          dlg.close();
-          toast('Transaction voided');
-          await afterSave();
-        } catch (ex) { toast(ex.message, { error: true }); }
-      }
+      try {
+        if (e.target.closest('[data-edit]')) await openTxnModal({ txn: t });
+        if (e.target.closest('[data-duplicate]')) await duplicateTxn(t.id);
+        if (e.target.closest('[data-void]') && (await voidTxn(t.id))) dlg.close();
+        if (e.target.closest('[data-restore]')) { await restoreTxn(t.id); dlg.close(); }
+      } catch (ex) { toast(ex.message, { error: true }); }
     },
   });
 }
@@ -477,7 +705,21 @@ export async function openFundModal(f = null) {
     ${field('Target amount', amountInput('target', f?.target), { hint: 'optional goal' })}
     ${field('Color', palettePicker(color))}
   </div>`;
-  open(modalShell({ title: f ? `Edit ${f.name}` : 'New fund', body, submit: f ? 'Save' : 'Create fund' }), {
+  const danger = f && !f.is_system
+    ? `<button type="button" class="btn btn-ghost" data-archive>${f.archived ? 'Restore' : 'Archive'}</button>
+       ${f.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '';
+  open(modalShell({ title: f ? `Edit ${f.name}` : 'New fund', body, submit: f ? 'Save' : 'Create fund', danger }), {
+    onClick: async (e) => {
+      try {
+        if (e.target.closest('[data-archive]')) {
+          await api(`/funds/${f.id}`, { method: 'PUT', body: { archived: !f.archived } });
+          dlg.close();
+          toast(f.archived ? 'Fund restored' : 'Fund archived');
+          await afterSave();
+        }
+        if (e.target.closest('[data-delete]')) { dlg.close(); await deleteRecord('fund', f.id); }
+      } catch (ex) { toast(ex.message, { error: true }); }
+    },
     onSubmit: async (form) => {
       const fd = new FormData(form);
       const target = parseAmount(fd.get('target'));
@@ -500,19 +742,46 @@ const ACCOUNT_TYPES = [
 ];
 
 export async function openAccountModal(a = null, presetKind = 'asset:bank') {
+  if (a) {
+    await loadRefs();
+    a = acct(a.id) || a;
+  }
   const current = a ? `${a.kind}:${a.subtype || ''}` : presetKind;
-  const options = ACCOUNT_TYPES.map(([v, l]) => `<option value="${v}" ${v === current ? 'selected' : ''}>${esc(l)}</option>`).join('');
+  // Once an account has transactions it may only switch within its kind
+  // (bank <-> e-wallet), never e.g. from a bank into an expense category.
+  const locked = a && (a.txn_count > 0 || a.is_system);
+  let types = locked ? ACCOUNT_TYPES.filter(([v]) => v.startsWith(`${a.kind}:`)) : ACCOUNT_TYPES;
+  if (!types.some(([v]) => v === current)) types = [[current, { equity: 'Bookkeeping', asset: 'Account' }[a?.kind] || current], ...types];
+  const options = types.map(([v, l]) => `<option value="${v}" ${v === current ? 'selected' : ''}>${esc(l)}</option>`).join('');
   const body = `<div class="form-grid">
     ${field('Name', `<input name="name" value="${esc(a?.name || '')}" ${a?.is_system ? 'disabled' : ''} required placeholder="e.g. BDO Savings">`, { span: true })}
-    ${field('Type', `<select name="type" ${a ? 'disabled' : ''}>${options}</select>`, { span: true })}
+    ${field('Type', `<select name="type" ${a?.is_system ? 'disabled' : ''}>${options}</select>`, { span: true, hint: locked && !a.is_system ? 'has transactions, so only similar types are allowed' : '' })}
     ${field('Notes', `<input name="notes" value="${esc(a?.notes || '')}" placeholder="Account number last 4 digits, branch…">`, { span: true })}
   </div>`;
-  open(modalShell({ title: a ? `Edit ${a.name}` : 'New account', body, submit: a ? 'Save' : 'Create' }), {
+  const danger = a && !a.is_system
+    ? `<button type="button" class="btn btn-ghost" data-archive>${a.archived ? 'Restore' : 'Archive'}</button>
+       ${a.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '';
+  open(modalShell({ title: a ? `Edit ${a.name}` : 'New account', body, submit: a ? 'Save' : 'Create', danger }), {
+    onClick: async (e) => {
+      try {
+        if (e.target.closest('[data-archive]')) {
+          await api(`/accounts/${a.id}`, { method: 'PUT', body: { archived: !a.archived } });
+          dlg.close();
+          toast(a.archived ? 'Restored' : 'Archived');
+          await afterSave();
+        }
+        if (e.target.closest('[data-delete]')) { dlg.close(); await deleteRecord('account', a.id); }
+      } catch (ex) { toast(ex.message, { error: true }); }
+    },
     onSubmit: async (form) => {
       const fd = new FormData(form);
       if (a) {
         const payload = { notes: fd.get('notes') };
-        if (!a.is_system) payload.name = fd.get('name');
+        if (!a.is_system) {
+          payload.name = fd.get('name');
+          const [kind, subtype] = fd.get('type').split(':');
+          Object.assign(payload, { kind, subtype });
+        }
         await api(`/accounts/${a.id}`, { method: 'PUT', body: payload });
         return 'Saved';
       }
@@ -546,7 +815,8 @@ export async function openObligationModal(ob = null) {
   </div>`;
   open(modalShell({
     title: ob ? `Edit ${ob.name}` : 'New obligation', body, submit: ob ? 'Save' : 'Add obligation',
-    danger: ob ? `<button type="button" class="btn btn-danger" data-archive>${ob.archived ? 'Restore' : 'Archive'}</button>` : '',
+    danger: ob ? `<button type="button" class="btn btn-ghost" data-archive>${ob.archived ? 'Restore' : 'Archive'}</button>
+      ${ob.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '',
   }), {
     onInput: async (e) => {
       const t = e.target;
@@ -559,12 +829,15 @@ export async function openObligationModal(ob = null) {
       }
     },
     onClick: async (e) => {
-      if (e.target.closest('[data-archive]')) {
-        await api(`/obligations/${ob.id}`, { method: 'PUT', body: { archived: !ob.archived } });
-        dlg.close();
-        toast(ob.archived ? 'Restored' : 'Archived');
-        await afterSave();
-      }
+      try {
+        if (e.target.closest('[data-archive]')) {
+          await api(`/obligations/${ob.id}`, { method: 'PUT', body: { archived: !ob.archived } });
+          dlg.close();
+          toast(ob.archived ? 'Restored' : 'Archived');
+          await afterSave();
+        }
+        if (e.target.closest('[data-delete]')) { dlg.close(); await deleteRecord('obligation', ob.id); }
+      } catch (ex) { toast(ex.message, { error: true }); }
     },
     onSubmit: async (form) => {
       const fd = new FormData(form);

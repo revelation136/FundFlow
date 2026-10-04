@@ -79,3 +79,76 @@ def test_demo_data_is_consistent(conn):
     demo.seed(conn, date(2026, 10, 5))
     assert ledger.integrity_report(conn)["transactions"] == report["transactions"]
     assert db.system_ids(conn)["unallocated_fund"]
+
+
+def _setup(client):
+    bdo = client.post("/api/accounts", json={"name": "BDO", "kind": "asset", "subtype": "bank"}).get_json()["account"]
+    salary = next(a for a in client.get("/api/accounts").get_json()["accounts"] if a["name"] == "Salary")
+    fund = client.post("/api/funds", json={"name": "Solar"}).get_json()["fund"]
+    txn = client.post("/api/transactions", json={
+        "type": "income", "date": "2026-09-01", "source_id": salary["id"], "account_id": bdo["id"],
+        "amount": 1000 * P, "splits": [{"fund_id": fund["id"], "amount": 1000 * P}],
+    }).get_json()["transaction"]
+    return bdo, salary, fund, txn
+
+
+def test_delete_only_unused_records(client):
+    bdo, salary, fund, _ = _setup(client)
+    spare_fund = client.post("/api/funds", json={"name": "Typo fund"}).get_json()["fund"]
+    spare_acct = client.post("/api/accounts", json={"name": "Typo", "kind": "expense"}).get_json()["account"]
+
+    funds = {f["name"]: f for f in client.get("/api/funds").get_json()["funds"]}
+    assert funds["Solar"]["txn_count"] == 1 and funds["Typo fund"]["txn_count"] == 0
+
+    assert client.delete(f"/api/funds/{spare_fund['id']}").status_code == 200
+    assert client.delete(f"/api/accounts/{spare_acct['id']}").status_code == 200
+    r = client.delete(f"/api/funds/{fund['id']}")
+    assert r.status_code == 400 and "Archive it instead" in r.get_json()["error"]
+    assert client.delete(f"/api/accounts/{bdo['id']}").status_code == 400
+    assert client.delete(f"/api/accounts/{salary['id']}").status_code == 400
+
+    audit = client.get("/api/audit").get_json()["items"]
+    assert {(a["action"], a["entity"]) for a in audit} >= {("delete", "fund"), ("delete", "account")}
+
+
+def test_change_account_type(client):
+    bdo, _, _, _ = _setup(client)
+    # Used accounts can change subtype but not kind.
+    assert client.put(f"/api/accounts/{bdo['id']}", json={"subtype": "ewallet"}).get_json()["account"]["subtype"] == "ewallet"
+    assert client.put(f"/api/accounts/{bdo['id']}", json={"kind": "liability"}).status_code == 400
+    fresh = client.post("/api/accounts", json={"name": "Visa", "kind": "asset"}).get_json()["account"]
+    r = client.put(f"/api/accounts/{fresh['id']}", json={"kind": "liability", "subtype": "credit_card"})
+    assert r.get_json()["account"]["kind"] == "liability"
+
+
+def test_void_and_restore(client):
+    _, _, fund, txn = _setup(client)
+    client.post(f"/api/transactions/{txn['id']}/void", json={"reason": "oops"})
+    assert client.get(f"/api/funds/{fund['id']}").get_json()["fund"]["balance"] == 0
+    r = client.post(f"/api/transactions/{txn['id']}/restore")
+    assert r.status_code == 200 and r.get_json()["transaction"]["voided_at"] is None
+    assert client.get(f"/api/funds/{fund['id']}").get_json()["fund"]["balance"] == 1000 * P
+    assert client.post(f"/api/transactions/{txn['id']}/restore").status_code == 400
+    actions = [a["action"] for a in client.get(f"/api/transactions/{txn['id']}").get_json()["audit"]]
+    assert actions == ["create", "void", "restore"]
+
+
+def test_obligation_archive_restore_delete(client):
+    bdo, _, fund, _ = _setup(client)
+    cat = client.post("/api/accounts", json={"name": "Premiums", "kind": "expense"}).get_json()["account"]
+    ob = client.post("/api/obligations", json={
+        "name": "VUL", "kind": "insurance", "amount": 100 * P, "frequency": "monthly",
+        "first_due": "2026-09-15", "fund_id": fund["id"], "account_id": bdo["id"], "category_id": cat["id"],
+    }).get_json()["obligation"]
+    client.put(f"/api/obligations/{ob['id']}", json={"archived": True})
+    plan = client.get("/api/plan?today=2026-10-05").get_json()
+    assert plan["obligations"] == [] and plan["archived"][0]["name"] == "VUL"
+    client.put(f"/api/obligations/{ob['id']}", json={"archived": False})
+    client.post("/api/transactions", json={"type": "payment", "date": "2026-09-15", "obligation_id": ob["id"]})
+    assert client.delete(f"/api/obligations/{ob['id']}").status_code == 400
+    # A fund linked to an obligation cannot be deleted either.
+    assert client.delete(f"/api/funds/{fund['id']}").status_code == 400
+    spare = client.post("/api/obligations", json={
+        "name": "Typo", "kind": "bill", "amount": 1 * P, "frequency": "monthly", "first_due": "2026-10-01",
+    }).get_json()["obligation"]
+    assert client.delete(f"/api/obligations/{spare['id']}").status_code == 200

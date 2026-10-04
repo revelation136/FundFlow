@@ -63,6 +63,19 @@ Options: `--port 5050`, `--db path/to/file.db`, `--host 127.0.0.1` (the default 
    The panels are shown as *funded by Salary 100%*; *Solar Project* has ₱18,000 left, all traceable to Salary.
 6. **Obligations → New obligation**: *Car Loan*, amortization, ₱18,500 monthly, 60 installments, 12 already paid → FundFlow shows ₱888,000 remaining, the next due date, and what to set aside.
 
+## Edit anything, from anywhere
+
+Every page lets you change what you see without hunting for a settings screen:
+
+- **✎ and ⋯ on every item** — funds, accounts, sources, categories, obligations and transactions all have an edit button and an actions menu (edit, add money, move money, record expense/income, reconcile, archive/restore, delete…).
+- **Click any amount in the allocation matrix** (or a fund chip on an account, or an amount on a fund page) to **adjust allocation**: set how much of an account belongs to a fund, and the difference moves to/from another fund as an audited allocation.
+- **Reconcile** an account to the balance your bank or e-wallet app shows; the difference is recorded as an adjustment.
+- **Transactions**: edit, duplicate, void, and restore voided ones — from the ledger, any history table, or the detail view.
+- **Accounts** can be renamed and retyped (bank ↔ e-wallet ↔ cash at any time; a different kind only while unused).
+- **Settings → Manage everything** lists every fund, account, source, category and obligation in one place, archived ones included.
+
+Rules that keep the ledger trustworthy: anything that has appeared in a transaction can be **archived** (hidden, history kept) but not deleted; anything never used can be **deleted**. Transactions are never deleted — voiding is reversible — and every change lands in the audit log.
+
 ## Transaction types
 
 | Type | Use it for | Postings (simplified) |
