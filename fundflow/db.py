@@ -2,7 +2,7 @@
 import json
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -96,9 +96,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail    TEXT NOT NULL DEFAULT '{}'
 );
 
--- The ledger is append-only: transactions are voided, never deleted.
+-- Transactions are voided, not deleted. The only exception is an explicit,
+-- confirmed purge (see maintenance.py), which raises a flag for the duration
+-- of its own database transaction and records full snapshots in the audit log.
 CREATE TRIGGER IF NOT EXISTS transactions_no_delete
 BEFORE DELETE ON transactions
+WHEN NOT EXISTS (SELECT 1 FROM meta WHERE key = 'purge_authorized')
 BEGIN
     SELECT RAISE(ABORT, 'transactions cannot be deleted; void them instead');
 END;
@@ -174,6 +177,21 @@ def init_db(conn: sqlite3.Connection) -> None:
                     "INSERT INTO accounts (name, kind, subtype, is_system) VALUES (?, ?, ?, ?)",
                     (name, kind, subtype, is_system),
                 )
+        return
+    version = int(have["value"])
+    if version < 2:
+        # v2: the no-delete trigger gained an escape hatch for confirmed purges.
+        with conn:
+            conn.execute("DROP TRIGGER IF EXISTS transactions_no_delete")
+            conn.execute(
+                """CREATE TRIGGER transactions_no_delete
+                   BEFORE DELETE ON transactions
+                   WHEN NOT EXISTS (SELECT 1 FROM meta WHERE key = 'purge_authorized')
+                   BEGIN
+                       SELECT RAISE(ABORT, 'transactions cannot be deleted; void them instead');
+                   END"""
+            )
+            conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
 
 
 def system_ids(conn: sqlite3.Connection) -> dict:
@@ -193,7 +211,7 @@ def system_ids(conn: sqlite3.Connection) -> dict:
 
 def settings(conn: sqlite3.Connection) -> dict:
     out = dict(DEFAULT_SETTINGS)
-    for row in conn.execute("SELECT key, value FROM meta WHERE key != 'schema_version'"):
+    for row in conn.execute("SELECT key, value FROM meta WHERE key NOT IN ('schema_version', 'purge_authorized')"):
         out[row["key"]] = row["value"]
     return out
 

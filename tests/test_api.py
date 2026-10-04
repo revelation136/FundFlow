@@ -92,7 +92,7 @@ def _setup(client):
     return bdo, salary, fund, txn
 
 
-def test_delete_only_unused_records(client):
+def test_delete_requires_choice_when_used(client):
     bdo, salary, fund, _ = _setup(client)
     spare_fund = client.post("/api/funds", json={"name": "Typo fund"}).get_json()["fund"]
     spare_acct = client.post("/api/accounts", json={"name": "Typo", "kind": "expense"}).get_json()["account"]
@@ -102,8 +102,9 @@ def test_delete_only_unused_records(client):
 
     assert client.delete(f"/api/funds/{spare_fund['id']}").status_code == 200
     assert client.delete(f"/api/accounts/{spare_acct['id']}").status_code == 200
+    # Records with history need an explicit choice (merge or delete-with-transactions).
     r = client.delete(f"/api/funds/{fund['id']}")
-    assert r.status_code == 400 and "Archive it instead" in r.get_json()["error"]
+    assert r.status_code == 400 and "mode=merge" in r.get_json()["error"]
     assert client.delete(f"/api/accounts/{bdo['id']}").status_code == 400
     assert client.delete(f"/api/accounts/{salary['id']}").status_code == 400
 

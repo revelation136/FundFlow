@@ -486,26 +486,110 @@ export async function restoreTxn(id) {
   await afterSave();
 }
 
-async function confirmDelete(path, name) {
-  const ok = await ask({
-    title: `Delete “${name}”?`,
-    message: 'It has never been used in a transaction, so no history is lost. This cannot be undone.',
-    confirm: 'Delete', danger: true,
-  });
-  if (!ok) return false;
-  await api(path, { method: 'DELETE' });
-  toast(`Deleted “${name}”`);
-  return true;
-}
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-export async function deleteRecord(kind, id) {
+/** Preview of the other balances a permanent delete would change. */
+function impactList(items) {
+  if (!items.length) return '<span class="choice-text">No other balances change.</span>';
+  const shown = items.slice(0, 8);
+  const risky = items.some((i) => i.goes_negative);
+  return `<div class="impact">
+    <span class="choice-text">${risky ? '<b class="neg">Some balances would go negative.</b> ' : ''}Other balances that would change:</span>
+    <ul>${shown.map((i) => `<li><span>${esc(i.name)} <span class="muted small">${i.type}</span></span>
+      <span class="num ${i.goes_negative ? 'neg' : ''}">${esc(money(i.delta, { sign: true }))} → ${esc(money(i.after))}${i.goes_negative ? ' ⚠' : ''}</span></li>`).join('')}
+    ${items.length > shown.length ? `<li class="muted">…and ${items.length - shown.length} more</li>` : ''}</ul></div>`;
+}
+const choice = (name, value, checked, title, text, extra = '') => `<label class="choice">
+  <input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''}>
+  <span><b>${esc(title)}</b><span class="choice-text">${text}</span>${extra}</span></label>`;
+
+/**
+ * Delete any fund, account or obligation. Unused ones just go; ones with
+ * history ask what should happen to their transactions (move them, or delete them too).
+ */
+export async function deleteRecord(kind, rawId) {
+  const id = Number(rawId);
   await loadRefs();
-  const rec = kind === 'fund' ? fund(id) : kind === 'account' ? acct(id) : (await api(`/obligations/${id}`)).obligation;
-  const path = `/${kind === 'fund' ? 'funds' : kind === 'account' ? 'accounts' : 'obligations'}/${id}`;
-  if (await confirmDelete(path, rec?.name || `#${id}`)) {
-    if (location.hash.startsWith(`#/${kind}s/${id}`)) location.hash = `#/${kind}s`;
+  const u = await api(`/usage/${kind}/${id}`);
+  const path = `/${kind}s/${id}`;
+  const name = u.name;
+  const leave = () => { if (location.hash.startsWith(`#/${kind}s/${id}`)) location.hash = `#/${kind}s`; };
+  const linked = u.obligations.length
+    ? `<p class="callout">Linked obligation${u.obligations.length > 1 ? 's' : ''}: <b>${esc(u.obligations.join(', '))}</b>. They will be switched to your choice below, or unlinked if you delete.</p>` : '';
+
+  if (!u.transactions) {
+    const ok = await ask({
+      title: `Delete “${name}”?`,
+      message: `It has no transactions, so no money history changes.${u.obligations.length ? ` ${u.obligations.join(', ')} will no longer be linked to it.` : ''} This cannot be undone.`,
+      confirm: 'Delete', danger: true,
+    });
+    if (!ok) return;
+    await api(path, { method: 'DELETE' });
+    leave();
+    toast(`Deleted “${name}”`);
     await afterSave();
+    return;
   }
+
+  const n = u.transactions;
+  const voidedNote = u.voided ? ` (${u.voided} of them voided)` : '';
+  const purgeConfirm = `<label class="check purge-confirm" data-purge-confirm hidden><input type="checkbox" name="understood"> I understand this permanently deletes ${plural(n, kind === 'obligation' ? 'payment' : 'transaction')}.</label>`;
+  let body;
+  let query;
+
+  if (kind === 'obligation') {
+    body = `<p>“${esc(name)}” has <b>${plural(n, 'recorded payment')}</b>${voidedNote}${u.amount ? `, ${esc(money(u.amount))} paid in total` : ''}. What should happen to them?</p>
+      ${choice('mode', 'keep', true, 'Keep the payments as regular expenses',
+        'Your balances stay exactly as they are; the payments just stop counting toward this obligation.')}
+      ${choice('mode', 'delete', false, 'Delete the payments too',
+        'They are removed permanently and the money goes back to the fund and account it was paid from. A full copy stays in the audit log.',
+        impactList(u.impact))}
+      ${purgeConfirm}
+      <p class="small muted">Its sinking fund is not deleted — remove that separately if you no longer need it.</p>`;
+    query = (fd) => `?payments=${fd.get('mode')}`;
+  } else {
+    const rec = kind === 'fund' ? fund(id) : acct(id);
+    const targets = kind === 'fund'
+      ? S.funds.filter((f) => f.id !== id)
+      : S.accounts.filter((a) => a.kind === rec.kind && a.id !== id && !a.is_system);
+    const preferred = kind === 'fund' ? S.meta.system.unallocated_fund : (targets.find((t) => !t.archived) || targets[0])?.id;
+    const noun = kind === 'fund' ? 'fund' : { asset: 'account', liability: 'credit card / loan', income: 'income source', expense: 'expense category' }[rec.kind] || 'account';
+    const options = targets.map((t) => `<option value="${t.id}" ${t.id === preferred ? 'selected' : ''}>${esc(t.name)}${t.archived ? ' (archived)' : ''}</option>`).join('');
+    const balance = rec?.balance ? ` and holds <b>${esc(money(rec.balance))}</b>` : '';
+    body = `<p>“${esc(name)}” is used in <b>${plural(n, 'transaction')}</b>${voidedNote}${balance}. What should happen to them?</p>
+      ${choice('mode', 'merge', targets.length > 0, `Move everything to another ${noun}`,
+        `Nothing is lost: the ${plural(n, 'transaction')} stay and point to the ${noun} you pick, which takes over the balance.${kind === 'account' ? ' Transfers between the two become no-ops and are voided automatically.' : ''}`,
+        targets.length ? `<select name="into" aria-label="Move into">${options}</select>` : `<span class="choice-text neg">There is no other ${noun} to move into yet.</span>`)}
+      ${choice('mode', 'delete', targets.length === 0, 'Delete the transactions too',
+        `Permanently removes all ${plural(n, 'transaction')} — whole transactions, so any other funds or accounts they touched change too. A full copy stays in the audit log.`,
+        impactList(u.impact))}
+      ${purgeConfirm}${linked}`;
+    query = (fd) => (fd.get('mode') === 'merge' ? `?mode=merge&into=${fd.get('into')}` : '?mode=delete');
+  }
+
+  const sync = (form) => {
+    const mode = new FormData(form).get('mode');
+    form.querySelector('[data-purge-confirm]').hidden = mode !== 'delete';
+    const into = form.querySelector('[name=into]');
+    if (into) into.disabled = mode !== 'merge';
+    form.querySelector('[type=submit]').textContent = mode === 'merge' ? 'Move & delete' : 'Delete';
+  };
+  const form = open(modalShell({ title: `Delete “${name}”`, body, submit: 'Delete' }), {
+    onInput: (e, f) => sync(f),
+    onSubmit: async (f) => {
+      const fd = new FormData(f);
+      const mode = fd.get('mode');
+      if (mode === 'merge' && !fd.get('into')) throw new Error('Choose where to move everything');
+      if (mode === 'delete' && !fd.get('understood')) throw new Error('Tick the box to confirm the permanent delete');
+      await api(path + query(fd), { method: 'DELETE' });
+      leave();
+      if (mode === 'merge') return `Moved ${plural(n, 'transaction')} and deleted “${name}”`;
+      if (mode === 'keep') return `Deleted “${name}” — payments kept as expenses`;
+      return `Deleted “${name}” and ${plural(n, kind === 'obligation' ? 'payment' : 'transaction')}`;
+    },
+  });
+  form.querySelector('[type=submit]').classList.replace('btn-primary', 'btn-danger-solid');
+  sync(form);
 }
 
 // ------------------------------------------------- allocation & reconciliation
@@ -707,7 +791,7 @@ export async function openFundModal(f = null) {
   </div>`;
   const danger = f && !f.is_system
     ? `<button type="button" class="btn btn-ghost" data-archive>${f.archived ? 'Restore' : 'Archive'}</button>
-       ${f.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '';
+       <button type="button" class="btn btn-danger" data-delete>Delete…</button>` : '';
   open(modalShell({ title: f ? `Edit ${f.name}` : 'New fund', body, submit: f ? 'Save' : 'Create fund', danger }), {
     onClick: async (e) => {
       try {
@@ -760,7 +844,7 @@ export async function openAccountModal(a = null, presetKind = 'asset:bank') {
   </div>`;
   const danger = a && !a.is_system
     ? `<button type="button" class="btn btn-ghost" data-archive>${a.archived ? 'Restore' : 'Archive'}</button>
-       ${a.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '';
+       <button type="button" class="btn btn-danger" data-delete>Delete…</button>` : '';
   open(modalShell({ title: a ? `Edit ${a.name}` : 'New account', body, submit: a ? 'Save' : 'Create', danger }), {
     onClick: async (e) => {
       try {
@@ -816,7 +900,7 @@ export async function openObligationModal(ob = null) {
   open(modalShell({
     title: ob ? `Edit ${ob.name}` : 'New obligation', body, submit: ob ? 'Save' : 'Add obligation',
     danger: ob ? `<button type="button" class="btn btn-ghost" data-archive>${ob.archived ? 'Restore' : 'Archive'}</button>
-      ${ob.txn_count ? '' : '<button type="button" class="btn btn-danger" data-delete>Delete</button>'}` : '',
+      <button type="button" class="btn btn-danger" data-delete>Delete…</button>` : '',
   }), {
     onInput: async (e) => {
       const t = e.target;

@@ -43,7 +43,7 @@ function fundMenu(id) {
     { label: 'View history', action: 'go', data: { href: `#/funds/${id}` } },
     '-',
     !f.is_system && { label: f.archived ? 'Restore fund' : 'Archive fund', action: 'archive-fund', data: { id, archived: f.archived } },
-    !f.is_system && !f.txn_count && { label: 'Delete fund', action: 'delete-fund', data: { id }, danger: true },
+    !f.is_system && { label: 'Delete fund…', action: 'delete-fund', data: { id }, danger: true },
   ], `Actions for ${f.name}`);
 }
 
@@ -64,7 +64,7 @@ function accountMenu(id) {
     { label: 'View history', action: 'go', data: { href: `#/accounts/${id}` } },
     '-',
     !a.is_system && { label: a.archived ? 'Restore' : 'Archive', action: 'archive-account', data: { id, archived: a.archived } },
-    !a.is_system && !a.txn_count && { label: 'Delete', action: 'delete-account', data: { id }, danger: true },
+    !a.is_system && { label: 'Delete…', action: 'delete-account', data: { id }, danger: true },
   ], `Actions for ${a.name}`);
 }
 
@@ -76,7 +76,7 @@ function obligationMenu(o) {
     o.fund_id && { label: 'Open sinking fund', action: 'go', data: { href: `#/funds/${o.fund_id}` } },
     '-',
     { label: o.archived ? 'Restore' : 'Archive', action: 'archive-obligation', data: { id: o.id, archived: o.archived ? 1 : 0 } },
-    !o.txn_count && { label: 'Delete', action: 'delete-obligation', data: { id: o.id }, danger: true },
+    { label: 'Delete…', action: 'delete-obligation', data: { id: o.id }, danger: true },
   ], `Actions for ${o.name}`);
 }
 
@@ -601,7 +601,7 @@ async function viewSettings() {
   const themeSeg = ['auto', 'light', 'dark'].map((m) => `<button type="button" data-action="set-theme" data-mode="${m}" aria-pressed="${theme === m}">${m[0].toUpperCase() + m.slice(1)}</button>`).join('');
   return `${pageHead('Settings', { sub: `FundFlow v${esc(S.meta.version)}` })}
   <div class="stack">
-    <div class="card"><div class="card-head"><h2>Manage everything</h2><span class="muted">edit, archive, restore or delete — items used in the ledger can be archived, unused ones deleted</span></div>
+    <div class="card"><div class="card-head"><h2>Manage everything</h2><span class="muted">edit, archive, restore or delete anything — deleting something with history lets you move its transactions or delete them too</span></div>
       <div class="tabs" role="tablist" data-manage-tabs>
         ${['Funds', 'Accounts', 'Sources', 'Categories', 'Obligations'].map((t, i) => `<button type="button" data-manage="${t}" aria-pressed="${i === manageTab.index}">${t}</button>`).join('')}
       </div>

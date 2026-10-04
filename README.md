@@ -74,7 +74,12 @@ Every page lets you change what you see without hunting for a settings screen:
 - **Accounts** can be renamed and retyped (bank ↔ e-wallet ↔ cash at any time; a different kind only while unused).
 - **Settings → Manage everything** lists every fund, account, source, category and obligation in one place, archived ones included.
 
-Rules that keep the ledger trustworthy: anything that has appeared in a transaction can be **archived** (hidden, history kept) but not deleted; anything never used can be **deleted**. Transactions are never deleted — voiding is reversible — and every change lands in the audit log.
+**Deleting** works on everything except the built-in Unallocated fund and bookkeeping accounts. When the item already has history, FundFlow asks what to do with it:
+
+- **Accounts and funds** — *move everything* into another account/fund (nothing is lost; the other one takes over the balance and history), or *delete the transactions too*. The dialog previews every other balance that would change and warns if any would go negative.
+- **Obligations** — *keep the payments* as regular expenses (balances unchanged), or *delete the payments too* (the money returns to the fund it was paid from).
+
+Permanent deletes need an explicit tick, remove whole transactions so the ledger stays balanced, and write a full copy of everything removed to the audit log. Day-to-day corrections use **void** (reversible) or **archive** (hide without deleting).
 
 ## Transaction types
 
