@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FundFlow</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Cpath d='M7 11h10M7 16h14M7 21h7' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3Ccircle cx='24' cy='11' r='2.5' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>FundFlow</span>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a href="#/" data-route="">Dashboard</a>
+        <a href="#/funds" data-route="funds">Funds</a>
+        <a href="#/accounts" data-route="accounts">Accounts</a>
+        <a href="#/plan" data-route="plan">Obligations</a>
+        <a href="#/ledger" data-route="ledger">Ledger</a>
+        <a href="#/flow" data-route="flow">Flow</a>
+        <a href="#/settings" data-route="settings">Settings</a>
+      </nav>
+      <div class="sidebar-foot">
+        <button class="btn btn-primary btn-block" data-action="new-txn">+ New transaction</button>
+        <button class="btn btn-ghost btn-sm theme-toggle" data-action="toggle-theme" aria-label="Toggle color theme">Theme: auto</button>
+      </div>
+    </aside>
+    <main id="main" class="main" tabindex="-1">
+      <div class="loading">Loading…</div>
+    </main>
+  </div>
+
+  <button class="fab" data-action="new-txn" aria-label="New transaction">+</button>
+  <dialog id="modal" class="modal"></dialog>
+  <div id="tooltip" class="tooltip" role="status" hidden></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
